@@ -1,5 +1,6 @@
 #!/usr/bin/python3
 import socket, logging, traceback
+from queue import Queue
 from gi.repository import GObject
 
 from lib.commands import ControlServerCommands
@@ -11,110 +12,113 @@ class ControlServer(TCPMultiConnection):
 		self.log = logging.getLogger('ControlServer')
 		super().__init__(port=9999)
 
+		self.command_queue = Queue()
+
 		self.commands = ControlServerCommands(pipeline)
+
+		GObject.idle_add(self.on_loop)
 
 	def on_accepted(self, conn, addr):
 		'''Asynchronous connection listener. Starts a handler for each connection.'''
-
 		self.log.debug('Setting GObject io-watch on Connection')
-		GObject.io_add_watch(conn, GObject.IO_IN, self.on_data)
+		GObject.io_add_watch(conn, GObject.IO_IN, self.on_data, [''])
+		GObject.io_add_watch(conn, GObject.IO_OUT, self.on_write)
 
-	def on_data(self, conn, *args):
-		'''Asynchronous connection handler. Processes each line from the socket.'''
-		# construct a file-like object fro mthe socket
-		# to be able to read linewise and in utf-8
-		filelike = conn.makefile('rw')
-
-		# read a line from the socket
-		line = ''
+	def on_data(self, conn, _, leftovers, *args):
+		'''Asynchronous connection handler. Pushes data from socket
+		into command queue linewise'''
 		try:
-			line = filelike.readline().strip()
-		except Exception as e:
-			self.log.warn("Can't read from socket: %s", e)
+			while True:
+				try:
+					leftovers.append(conn.recv(4096).decode(errors='replace'))
+					if len(leftovers[-1]) == 0:
+						self.log.info("Socket was closed")
+						self.close_connection(conn)
+						return False
+				except UnicodeDecodeError as e:
+					continue
+		except BlockingIOError as e:
+			pass
 
-		# no data = remote closed connection
-		if len(line) == 0:
-			self.close_connection(conn)
-			return False
+		data = "".join(leftovers)
+		leftovers.clear()
 
-		# 'quit' = remote wants us to close the connection
-		if line == 'quit':
-			self.log.info("Client asked us to close the Connection")
-			self.close_connection(conn)
-			return False
+		lines = data.split('\n')
+		for line in lines[:-1]:
+			self.log.debug("Got line: %r", line)
 
-		# process the received line
-		success, msg = self.processLine(conn, line)
+			line = line.strip()
+			# TODO: move quit to on_loop
+			# 'quit' = remote wants us to close the connection
+			if line == 'quit':
+				self.log.info("Client asked us to close the Connection")
+				self.close_connection(conn)
+				return False
 
-		# success = False -> error 
-		if success == False:
-			# on error-responses the message is mandatory
-			if msg is None:
-				msg = '<no message>'
+			self.command_queue.put((line, conn))
 
-			# respond with 'error' and the message
-			filelike.write('error '+msg+'\n')
-			self.log.info("Function-Call returned an Error: %s", msg)
+		self.log.debug("Remaining %r", lines[-1])
+		leftovers.append(lines[-1])
+		return True
 
-			# keep on listening on that connection
+	def on_loop(self):
+		'''Command handler. Processes commands in the command queue whenever
+		nothing else is happening (registered as GObject idle callback)'''
+		if self.command_queue.empty():
 			return True
+		line, requestor = self.command_queue.get()
 
-		# success = True and not message
-		if msg is None:
-			# respond with a simple 'ok'
-			filelike.write('ok\n')
+		words = line.split()
+		command = words[0]
+		args = words[1:]
+
+		try:
+			f = self.commands.fetch(command)
+			message, send_signals = f(*args)
+			response = "ok %s\n" % message
+
+		except Exception as e:
+			message = str(e) or "<no message>"
+			response = "error %s\n" % message
+
 		else:
-			# respond with the returned message
-			filelike.write('ok '+msg+'\n')
+			if send_signals:
+				signal = "signal %s\n" % line
+				for conn, queue in self.currentConnections.items():
+					if conn == requestor:
+						continue
+					queue.put(signal)
+
+		finally:
+			self.currentConnections[requestor].put(response)
 
 		return True
 
-	def processLine(self, conn, line):
-		# split line into command and optional args
-		command, argstring = (line+' ').split(' ', 1)
-		args = argstring.strip().split()
-
-		# log function-call as parsed
-		self.log.info("Read Function-Call from %s: %s( %s )", conn.getpeername(), command, args)
-
-		# check that the function-call is a known Command
-		if not hasattr(self.commands, command):
-			return False, 'unknown command %s' % command
-
+	def on_write(self, conn, *args):
+		# TODO: on_loop() is not called as soon as there is a writable socket
+		self.on_loop()
 
 		try:
-			# fetch the function-pointer
-			f = getattr(self.commands, command)
+			queue = self.currentConnections[conn]
+		except KeyError:
+			return False
 
-			# call the function
-			ret = f(*args)
-
-			# signal method call to all other connected clients
-			self.signal(conn, command, args)
-
-			# if it returned an iterable, probably (Success, Message), pass that on
-			if hasattr(ret, '__iter__'):
-				return ret
-			else:
-				# otherwise construct a tuple
-				return (ret, None)
-
+		if queue.empty():
+				return True
+		message = queue.get()
+		try:
+			conn.send(message.encode())
 		except Exception as e:
-			self.log.error("Trapped Exception in Remote-Communication: %s", e)
+			self.log.warn(e)
 
-			# In case of an Exception, return that
-			return False, str(e)
+		return True
 
-	def signal(self, origin_conn, command, args):
-		for conn in self.currentConnections:
-			if conn == origin_conn:
-				continue
-
-			self.log.debug(
-				'signaling connection %s the successful '
-				'execution of the command %s',
-				conn.getpeername(), command)
-
-			conn.makefile('w').write(
-				"signal %s %s\n" % (command, ' '.join(args))
-			)
+	def notify_all(self, msg):
+		try:
+			words = msg.split()
+			words[-1] = self.commands.encodeSourceName(int(words[-1]))
+			msg = " ".join(words) + '\n'
+			for queue in self.currentConnections.values():
+				queue.put(msg)
+		except Exception as e:
+			self.log.debug("Error during notify: %s", e)
